@@ -9,8 +9,8 @@ from .models import SlowQueryRecord, AnalysisResult
 class QueryAnalyzer:
     """SQL查询分析器"""
 
-    HIGH_SEVERITY_THRESHOLD = 10000
-    MEDIUM_SEVERITY_THRESHOLD = 1000
+    HIGH_SEVERITY_THRESHOLD = 1000000
+    MEDIUM_SEVERITY_THRESHOLD = 100000
 
     PATTERNS = [
         {
@@ -100,10 +100,10 @@ class QueryAnalyzer:
         return result
 
     def _calc_severity_score(self, record: SlowQueryRecord) -> float:
-        """计算严重分数：执行次数 × 平均耗时(秒) × 扫描行数^(1/3)"""
+        """计算严重分数：执行次数 × 平均耗时(秒) × 扫描行数"""
         count_weight = record.exec_count
         time_weight = max(record.avg_time, 0.001)
-        rows_weight = max(record.rows_examined, 1) ** (1 / 3)
+        rows_weight = max(record.rows_examined, 1)
         return round(count_weight * time_weight * rows_weight, 2)
 
     def _analyze_patterns(self, record: SlowQueryRecord) -> Tuple[List[str], List[str]]:
