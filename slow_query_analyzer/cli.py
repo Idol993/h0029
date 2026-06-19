@@ -101,19 +101,19 @@ def _resolve_port(args) -> int:
 
 
 def _fetch_current_records(args, show_progress: bool):
-    """根据参数获取当前慢查询记录"""
+    """根据参数获取当前慢查询记录，返回(records, source_type, fetcher_instance_or_None)"""
     port = _resolve_port(args)
 
     if args.db == "mysql":
         if args.log:
             parser = MySQLSlowLogParser(show_progress=show_progress)
-            return parser.parse(args.log), "log"
+            return parser.parse(args.log), "log", None
         else:
             fetcher = MySQLDirectFetcher(
                 host=args.host, port=port, user=args.user,
                 password=args.passwd, database=args.dbname, limit=args.limit,
             )
-            return fetcher.fetch(), "direct"
+            return fetcher.fetch(), "direct", fetcher
 
     elif args.db == "postgres":
         fetcher = PostgresStatsFetcher(
@@ -121,7 +121,7 @@ def _fetch_current_records(args, show_progress: bool):
             password=args.passwd, database=args.dbname or "postgres",
             limit=args.limit, show_progress=show_progress,
         )
-        return fetcher.fetch(), "direct"
+        return fetcher.fetch(), "direct", None
 
 
 def _load_baseline_records(args, show_progress: bool):
@@ -168,24 +168,53 @@ def main():
             console.print("[red]MySQL模式需要指定 --log（日志文件）或提供 --host（直连模式）[/red]")
             sys.exit(1)
 
-        records, source_type = _fetch_current_records(args, show_progress)
+        records, source_type, fetcher = _fetch_current_records(args, show_progress)
+
+        source_label = f"{args.db} ({'日志' if source_type == 'log' else '直连'})"
+
+        if fetcher and hasattr(fetcher, 'get_warnings'):
+            for warn in fetcher.get_warnings():
+                console.print(f"[yellow]⚠ {warn}[/yellow]")
 
         if not records:
-            console.print("[yellow]未找到任何慢查询记录[/yellow]")
+            if source_type == "direct" and fetcher and hasattr(fetcher, 'get_warnings'):
+                warnings = fetcher.get_warnings()
+                if warnings:
+                    for w in warnings:
+                        console.print(f"[yellow]{w}[/yellow]")
+                else:
+                    console.print(
+                        "[yellow]未从数据库采集到任何慢查询记录。"
+                        "建议检查 performance_schema/sys 视图、consumer开关和业务流量。[/yellow]"
+                    )
+            else:
+                console.print("[yellow]未找到任何慢查询记录[/yellow]")
             return
 
         analyzer = QueryAnalyzer()
         result = analyzer.analyze(records)
 
         if args.top and len(result.records) > args.top:
-            result.records = result.records[:args.top]
-            result.total_queries = len(result.records)
-            result.total_time = sum(r.total_time for r in result.records)
+            top_records = result.records[:args.top]
+            result.records = top_records
+            result.total_queries = len(top_records)
+            result.total_time = sum(r.total_time for r in top_records)
+            result.high_severity_count = sum(
+                1 for r in top_records
+                if r.severity_score >= analyzer.HIGH_SEVERITY_THRESHOLD
+            )
+            result.medium_severity_count = sum(
+                1 for r in top_records
+                if analyzer.MEDIUM_SEVERITY_THRESHOLD
+                <= r.severity_score < analyzer.HIGH_SEVERITY_THRESHOLD
+            )
+            result.low_severity_count = sum(
+                1 for r in top_records
+                if r.severity_score < analyzer.MEDIUM_SEVERITY_THRESHOLD
+            )
 
         reporter = ReportGenerator()
         reporter.print_terminal_report(result)
-
-        source_label = f"{args.db} ({'日志' if source_type == 'log' else '直连'})"
 
         if args.save_snapshot:
             snap_path = save_snapshot(
@@ -195,6 +224,9 @@ def main():
             console.print(f"[green]快照已保存: {snap_path}[/green]")
 
         baseline_records = _load_baseline_records(args, show_progress)
+        comp_result = None
+        baseline_name = None
+        current_name = None
 
         if baseline_records:
             baseline_result = analyzer.analyze(baseline_records)
@@ -211,17 +243,17 @@ def main():
             current_name = Path(args.log).name if args.log else f"{args.db}直连"
             reporter.print_comparison_report(comp_result, baseline_name, current_name)
 
-            if args.output:
-                base_stem, ext = Path(args.output).stem, Path(args.output).suffix
-                comp_path = str(Path(args.output).with_name(f"{base_stem}_comparison{ext}"))
-                exported = reporter.export_comparison_markdown(
-                    comp_result, comp_path, baseline_name, current_name
-                )
-                console.print(f"[green]对比报告已导出: {exported}[/green]")
-
         if args.output:
             exported = reporter.export_markdown(result, args.output)
-            console.print(f"[green]报告已导出: {exported}[/green]")
+            console.print(f"[green]当前报告已导出: {exported}[/green]")
+
+            if comp_result is not None:
+                base_stem, ext = Path(args.output).stem, Path(args.output).suffix
+                comp_path = str(Path(args.output).with_name(f"{base_stem}_comparison{ext}"))
+                comp_exported = reporter.export_comparison_markdown(
+                    comp_result, comp_path, baseline_name, current_name
+                )
+                console.print(f"[green]对比报告已导出: {comp_exported}[/green]")
 
     except KeyboardInterrupt:
         console.print("\n[yellow]操作已取消[/yellow]")

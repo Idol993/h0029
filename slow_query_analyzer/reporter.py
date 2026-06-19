@@ -156,21 +156,87 @@ class ReportGenerator:
         if comp_result.added:
             lines.append("## 新增慢查询")
             lines.append("")
-            lines.append("| SQL | 执行次数 | 平均耗时(s) | 总耗时(s) |")
-            lines.append("|-----|----------|-------------|-----------|")
-            for rec in comp_result.added:
+            lines.append("| # | 严重级别 | 分数 | 执行次数 | 平均耗时(s) | 总耗时(s) | 扫描行数 | 返回行数 | SQL |")
+            lines.append("|---|----------|------|----------|-------------|-----------|----------|----------|-----|")
+            for idx, rec in enumerate(comp_result.added[:50], 1):
+                level, _ = QueryAnalyzer.get_severity_level(rec.severity_score)
                 short_sql = self._truncate_sql(rec.sql).replace('|', '\\|').replace('\n', ' ')
-                lines.append(f"| `{short_sql}` | {rec.exec_count} | {rec.avg_time:.4f} | {rec.total_time:.2f} |")
+                lines.append(
+                    f"| {idx} | {level} | {rec.severity_score:.0f} | {rec.exec_count} | "
+                    f"{rec.avg_time:.4f} | {rec.total_time:.2f} | {rec.rows_examined:,} | "
+                    f"{rec.rows_sent:,} | `{short_sql}` |"
+                )
             lines.append("")
+            lines.append("### 新增SQL详细分析")
+            lines.append("")
+            self._append_comparison_detail_section(lines, comp_result.added)
 
         if comp_result.removed:
             lines.append("## 已消失慢查询")
             lines.append("")
-            lines.append("| SQL | 执行次数 | 平均耗时(s) | 总耗时(s) |")
-            lines.append("|-----|----------|-------------|-----------|")
-            for rec in comp_result.removed:
+            lines.append("| # | 严重级别 | 分数 | 执行次数 | 平均耗时(s) | 总耗时(s) | 扫描行数 | 返回行数 | SQL |")
+            lines.append("|---|----------|------|----------|-------------|-----------|----------|----------|-----|")
+            for idx, rec in enumerate(comp_result.removed[:50], 1):
+                level, _ = QueryAnalyzer.get_severity_level(rec.severity_score)
                 short_sql = self._truncate_sql(rec.sql).replace('|', '\\|').replace('\n', ' ')
-                lines.append(f"| `{short_sql}` | {rec.exec_count} | {rec.avg_time:.4f} | {rec.total_time:.2f} |")
+                lines.append(
+                    f"| {idx} | {level} | {rec.severity_score:.0f} | {rec.exec_count} | "
+                    f"{rec.avg_time:.4f} | {rec.total_time:.2f} | {rec.rows_examined:,} | "
+                    f"{rec.rows_sent:,} | `{short_sql}` |"
+                )
+            lines.append("")
+
+        if comp_result.worsened:
+            lines.append("## 性能恶化（总耗时增长1.5x以上）")
+            lines.append("")
+            lines.append(
+                "| # | 变化倍数 | 基线耗时(s) | 当前耗时(s) | 基线次数 | 当前次数 | 基线平均(s) | 当前平均(s) | "
+                "基线扫描行 | 当前扫描行 | 严重分数 | SQL |"
+            )
+            lines.append(
+                "|---|----------|-------------|-------------|----------|----------|-------------|-------------|"
+                "------------|------------|----------|-----|"
+            )
+            for idx, (base, curr, ratio) in enumerate(comp_result.worsened[:50], 1):
+                short_sql = self._truncate_sql(curr.sql).replace('|', '\\|').replace('\n', ' ')
+                lines.append(
+                    f"| {idx} | **{ratio:.2f}x** | {base.total_time:.2f} | {curr.total_time:.2f} | "
+                    f"{base.exec_count} | {curr.exec_count} | {base.avg_time:.4f} | {curr.avg_time:.4f} | "
+                    f"{base.rows_examined:,} | {curr.rows_examined:,} | "
+                    f"{curr.severity_score:.0f} | `{short_sql}` |"
+                )
+            lines.append("")
+            lines.append("### 恶化SQL详细对比")
+            lines.append("")
+            self._append_change_detail_section(lines, comp_result.worsened, "恶化")
+
+        if comp_result.improved:
+            lines.append("## 性能改善（总耗时下降到67%以下）")
+            lines.append("")
+            lines.append(
+                "| # | 变化倍数 | 基线耗时(s) | 当前耗时(s) | 基线次数 | 当前次数 | 基线平均(s) | 当前平均(s) | "
+                "基线扫描行 | 当前扫描行 | 严重分数 | SQL |"
+            )
+            lines.append(
+                "|---|----------|-------------|-------------|----------|----------|-------------|-------------|"
+                "------------|------------|----------|-----|"
+            )
+            for idx, (base, curr, ratio) in enumerate(comp_result.improved[:50], 1):
+                short_sql = self._truncate_sql(curr.sql).replace('|', '\\|').replace('\n', ' ')
+                lines.append(
+                    f"| {idx} | **{ratio:.2f}x** | {base.total_time:.2f} | {curr.total_time:.2f} | "
+                    f"{base.exec_count} | {curr.exec_count} | {base.avg_time:.4f} | {curr.avg_time:.4f} | "
+                    f"{base.rows_examined:,} | {curr.rows_examined:,} | "
+                    f"{curr.severity_score:.0f} | `{short_sql}` |"
+                )
+            lines.append("")
+            lines.append("### 改善SQL详细对比")
+            lines.append("")
+            self._append_change_detail_section(lines, comp_result.improved, "改善")
+
+        if comp_result.unchanged:
+            lines.append("## 无显著变化")
+            lines.append(f"（共 {len(comp_result.unchanged)} 条SQL的总耗时变化在0.67x~1.5x之间）")
             lines.append("")
 
         output = '\n'.join(lines)
@@ -178,6 +244,52 @@ class ReportGenerator:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(output, encoding='utf-8')
         return str(path)
+
+    def _append_comparison_detail_section(self, lines: list, records):
+        """为新增/消失的SQL追加详细分析块"""
+        for idx, rec in enumerate(records[:30], 1):
+            lines.append(f"#### #{idx}")
+            lines.append("")
+            lines.append("```sql")
+            lines.append(QueryAnalyzer.format_sql(rec.sql))
+            lines.append("```")
+            lines.append("")
+            lines.append(f"- **执行次数**: {rec.exec_count}")
+            lines.append(f"- **平均耗时**: {rec.avg_time:.4f}s")
+            lines.append(f"- **总耗时**: {rec.total_time:.2f}s")
+            lines.append(f"- **扫描行数**: {rec.rows_examined:,}")
+            lines.append(f"- **返回行数**: {rec.rows_sent:,}")
+            if rec.patterns:
+                lines.append(f"- **匹配模式**: {', '.join(rec.patterns)}")
+            if rec.suggestions:
+                lines.append("- **优化建议**:")
+                for s in rec.suggestions:
+                    lines.append(f"  - {s}")
+            lines.append("")
+
+    def _append_change_detail_section(self, lines: list, pairs, label: str):
+        """为恶化/改善的SQL追加详细对比块"""
+        for idx, (base, curr, ratio) in enumerate(pairs[:30], 1):
+            lines.append(f"#### #{idx} [{label}] 变化 {ratio:.2f}x")
+            lines.append("")
+            lines.append("```sql")
+            lines.append(QueryAnalyzer.format_sql(curr.sql))
+            lines.append("```")
+            lines.append("")
+            lines.append("| 指标 | 基线 | 当前 |")
+            lines.append("|------|------|------|")
+            lines.append(f"| 总耗时 | {base.total_time:.2f}s | {curr.total_time:.2f}s |")
+            lines.append(f"| 执行次数 | {base.exec_count} | {curr.exec_count} |")
+            lines.append(f"| 平均耗时 | {base.avg_time:.4f}s | {curr.avg_time:.4f}s |")
+            lines.append(f"| 扫描行数 | {base.rows_examined:,} | {curr.rows_examined:,} |")
+            lines.append(f"| 返回行数 | {base.rows_sent:,} | {curr.rows_sent:,} |")
+            lines.append(f"| 严重分数 | {base.severity_score:.0f} | {curr.severity_score:.0f} |")
+            lines.append("")
+            if curr.suggestions:
+                lines.append("- **当前优化建议**:")
+                for s in curr.suggestions:
+                    lines.append(f"  - {s}")
+            lines.append("")
 
     def _print_summary(self, result: AnalysisResult, title: str):
         """打印概览面板"""
@@ -266,21 +378,28 @@ class ReportGenerator:
         self.console.print(table)
 
     def _print_simple_query_table(self, records, title: str, border_style: str = "blue"):
-        """打印简单的查询表格"""
+        """打印简单的查询表格（带严重分数、扫描行数）"""
         table = Table(title=title, box=box.ROUNDED, border_style=border_style)
         table.add_column("#", justify="right", style="dim", width=4)
+        table.add_column("级别", width=6)
+        table.add_column("分数", justify="right", width=8)
         table.add_column("次数", justify="right", width=6)
         table.add_column("平均耗时(s)", justify="right", width=10)
         table.add_column("总耗时(s)", justify="right", width=10)
+        table.add_column("扫描行数", justify="right", width=10)
         table.add_column("SQL", overflow="fold")
 
         for idx, rec in enumerate(records[:10], 1):
+            level, color = QueryAnalyzer.get_severity_level(rec.severity_score)
             short_sql = self._truncate_sql(rec.sql)
             table.add_row(
                 str(idx),
+                f"[{color}]{level}[/{color}]",
+                f"{rec.severity_score:.0f}",
                 str(rec.exec_count),
                 f"{rec.avg_time:.4f}",
                 f"{rec.total_time:.2f}",
+                f"{rec.rows_examined:,}",
                 short_sql,
             )
         self.console.print(table)
